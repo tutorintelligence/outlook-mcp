@@ -70,107 +70,97 @@ async function handleSearchEmails(args) {
  * @returns {Promise<object>} - Search results
  */
 async function progressiveSearch(endpoint, accessToken, searchTerms, filterTerms, maxCount) {
-  // Track search strategies attempted
-  const searchAttempts = [];
-  
-  // 1. Try combined search (most specific)
-  try {
-    const params = buildSearchParams(searchTerms, filterTerms, Math.min(50, maxCount));
-    console.error("Attempting combined search with params:", params);
-    searchAttempts.push("combined-search");
-    
-    const response = await callGraphAPIPaginated(accessToken, 'GET', endpoint, params, maxCount);
-    if (response.value && response.value.length > 0) {
-      console.error(`Combined search successful: found ${response.value.length} results`);
-      return response;
-    }
-  } catch (error) {
-    console.error(`Combined search failed: ${error.message}`);
+  const hasSearchTerms = searchTerms.query || searchTerms.from || searchTerms.to || searchTerms.subject;
+  const hasBooleanFilters = filterTerms.hasAttachments === true || filterTerms.unreadOnly === true;
+
+  // If no search criteria provided, just return recent emails
+  if (!hasSearchTerms && !hasBooleanFilters) {
+    console.error("No search criteria provided, returning recent emails");
+    const basicParams = {
+      $top: Math.min(50, maxCount),
+      $select: config.EMAIL_SELECT_FIELDS,
+      $orderby: 'receivedDateTime desc'
+    };
+    const response = await callGraphAPIPaginated(accessToken, 'GET', endpoint, basicParams, maxCount);
+    response._searchInfo = { strategy: 'recent-emails', reason: 'no-criteria' };
+    return response;
   }
-  
-  // 2. Try each search term individually, starting with most specific
-  const searchPriority = ['subject', 'from', 'to', 'query'];
-  
-  for (const term of searchPriority) {
-    if (searchTerms[term]) {
-      try {
-        console.error(`Attempting search with only ${term}: "${searchTerms[term]}"`);
-        searchAttempts.push(`single-term-${term}`);
-        
-        // For single term search, only use $search with that term
-        const simplifiedParams = {
-          $top: Math.min(50, maxCount),
-          $select: config.EMAIL_SELECT_FIELDS,
-          $orderby: 'receivedDateTime desc'
-        };
-        
-        // Add the search term in the appropriate KQL syntax
-        if (term === 'query') {
-          // General query doesn't need a prefix
-          simplifiedParams.$search = `"${searchTerms[term]}"`;
-        } else {
-          // Specific field searches use field:value syntax
-          simplifiedParams.$search = `${term}:"${searchTerms[term]}"`;
-        }
-        
-        // Add boolean filters if applicable
-        addBooleanFilters(simplifiedParams, filterTerms);
-        
-        const response = await callGraphAPIPaginated(accessToken, 'GET', endpoint, simplifiedParams, maxCount);
-        if (response.value && response.value.length > 0) {
-          console.error(`Search with ${term} successful: found ${response.value.length} results`);
+
+  // 1. Try $search with all terms combined (most specific)
+  // NOTE: $search and $orderby cannot be used together on the messages endpoint
+  if (hasSearchTerms) {
+    try {
+      const params = buildSearchParams(searchTerms, filterTerms, Math.min(50, maxCount));
+      console.error("Attempting combined search with params:", JSON.stringify(params));
+
+      const response = await callGraphAPIPaginated(accessToken, 'GET', endpoint, params, maxCount);
+      console.error(`Combined search returned ${response.value?.length || 0} results`);
+      response._searchInfo = { strategy: 'combined-search' };
+      return response;
+    } catch (error) {
+      console.error(`Combined search failed: ${error.message}`);
+    }
+
+    // 2. Try each search term individually
+    const searchPriority = ['from', 'to', 'subject', 'query'];
+    for (const term of searchPriority) {
+      if (searchTerms[term]) {
+        try {
+          console.error(`Attempting search with only ${term}: "${searchTerms[term]}"`);
+          const simplifiedParams = {
+            $top: Math.min(50, maxCount),
+            $select: config.EMAIL_SELECT_FIELDS
+            // No $orderby — incompatible with $search
+          };
+
+          if (term === 'query') {
+            simplifiedParams.$search = `"${searchTerms[term]}"`;
+          } else {
+            simplifiedParams.$search = `${term}:"${searchTerms[term]}"`;
+          }
+
+          addBooleanFilters(simplifiedParams, filterTerms);
+
+          const response = await callGraphAPIPaginated(accessToken, 'GET', endpoint, simplifiedParams, maxCount);
+          console.error(`Search with ${term} returned ${response.value?.length || 0} results`);
+          response._searchInfo = { strategy: `single-term-${term}` };
           return response;
+        } catch (error) {
+          console.error(`Search with ${term} failed: ${error.message}`);
         }
-      } catch (error) {
-        console.error(`Search with ${term} failed: ${error.message}`);
       }
     }
   }
-  
-  // 3. Try with only boolean filters
-  if (filterTerms.hasAttachments === true || filterTerms.unreadOnly === true) {
+
+  // 3. Try with only boolean filters (these use $filter, compatible with $orderby)
+  if (hasBooleanFilters) {
     try {
       console.error("Attempting search with only boolean filters");
-      searchAttempts.push("boolean-filters-only");
-      
       const filterOnlyParams = {
         $top: Math.min(50, maxCount),
         $select: config.EMAIL_SELECT_FIELDS,
         $orderby: 'receivedDateTime desc'
       };
-      
-      // Add the boolean filters
       addBooleanFilters(filterOnlyParams, filterTerms);
-      
+
       const response = await callGraphAPIPaginated(accessToken, 'GET', endpoint, filterOnlyParams, maxCount);
-      console.error(`Boolean filter search found ${response.value?.length || 0} results`);
+      console.error(`Boolean filter search returned ${response.value?.length || 0} results`);
+      response._searchInfo = { strategy: 'boolean-filters-only' };
       return response;
     } catch (error) {
       console.error(`Boolean filter search failed: ${error.message}`);
     }
   }
-  
-  // 4. Final fallback: just get recent emails with pagination
-  console.error("All search strategies failed, falling back to recent emails");
-  searchAttempts.push("recent-emails");
-  
+
+  // 4. All strategies threw errors — fall back to recent emails
+  console.error("All search strategies failed with errors, falling back to recent emails");
   const basicParams = {
     $top: Math.min(50, maxCount),
     $select: config.EMAIL_SELECT_FIELDS,
     $orderby: 'receivedDateTime desc'
   };
-  
   const response = await callGraphAPIPaginated(accessToken, 'GET', endpoint, basicParams, maxCount);
-  console.error(`Fallback to recent emails found ${response.value?.length || 0} results`);
-  
-  // Add a note to the response about the search attempts
-  response._searchInfo = {
-    attemptsCount: searchAttempts.length,
-    strategies: searchAttempts,
-    originalTerms: searchTerms,
-    filterTerms: filterTerms
-  };
-  
+  response._searchInfo = { strategy: 'recent-emails', reason: 'all-strategies-errored' };
   return response;
 }
 
@@ -184,38 +174,39 @@ async function progressiveSearch(endpoint, accessToken, searchTerms, filterTerms
 function buildSearchParams(searchTerms, filterTerms, count) {
   const params = {
     $top: count,
-    $select: config.EMAIL_SELECT_FIELDS,
-    $orderby: 'receivedDateTime desc'
+    $select: config.EMAIL_SELECT_FIELDS
   };
-  
-  // Handle search terms
+
+  // Build KQL search terms
   const kqlTerms = [];
-  
+
   if (searchTerms.query) {
-    // General query doesn't need a prefix
-    kqlTerms.push(searchTerms.query);
+    kqlTerms.push(`"${searchTerms.query}"`);
   }
-  
+
   if (searchTerms.subject) {
     kqlTerms.push(`subject:"${searchTerms.subject}"`);
   }
-  
+
   if (searchTerms.from) {
     kqlTerms.push(`from:"${searchTerms.from}"`);
   }
-  
+
   if (searchTerms.to) {
     kqlTerms.push(`to:"${searchTerms.to}"`);
   }
-  
-  // Add $search if we have any search terms
+
   if (kqlTerms.length > 0) {
+    // $search and $orderby cannot be used together on messages endpoint
     params.$search = kqlTerms.join(' ');
+  } else {
+    // No search terms — safe to use $orderby
+    params.$orderby = 'receivedDateTime desc';
   }
-  
+
   // Add boolean filters
   addBooleanFilters(params, filterTerms);
-  
+
   return params;
 }
 
@@ -268,7 +259,7 @@ function formatSearchResults(response) {
   // Add search strategy info if available
   let additionalInfo = '';
   if (response._searchInfo) {
-    additionalInfo = `\n(Search used ${response._searchInfo.strategies[response._searchInfo.strategies.length - 1]} strategy)`;
+    additionalInfo = `\n(Search used ${response._searchInfo.strategy} strategy)`;
   }
   
   return {
